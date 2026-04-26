@@ -207,15 +207,25 @@ class AnalysisPlugin(AnalysisPluginV0):
         file_path = os.path.realpath(file_path)
 
         with tempfile.TemporaryDirectory(prefix='fact-ghidra-targeted-') as output_dir:
-            self._run_targeted_analysis_in_docker(
+            docker_result = self._run_targeted_analysis_in_docker(
                 file_path, output_dir, entry_points, sensitive_vars, max_depth
             )
+
+            if docker_result.returncode != 0:
+                logging.error(
+                    '[ghidra_targeted_analysis] Docker execution failed (exit_code=%s). Output:\n%s',
+                    docker_result.returncode,
+                    docker_result.stdout or '<no output>',
+                )
+                raise AnalysisFailedError(
+                    'Ghidra targeted analysis container execution failed (see logs for details)'
+                )
 
             result_path = Path(output_dir) / 'result.json'
             if not result_path.exists():
                 logging.error(
-                    '[ghidra_targeted_analysis] result.json not found. '
-                    'Ghidra may have failed silently.'
+                    '[ghidra_targeted_analysis] result.json not found. Container output:\n%s',
+                    docker_result.stdout or '<no output>',
                 )
                 raise AnalysisFailedError(
                     'Ghidra targeted analysis did not produce a result file (see logs for details)'

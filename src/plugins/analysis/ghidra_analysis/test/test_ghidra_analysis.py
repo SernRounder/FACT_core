@@ -38,6 +38,13 @@ SAMPLE_RESULT = {
     ]
 }
 
+SAMPLE_ENTRY_POINTS_RESULT = {
+    'entry_points': [
+        {'name': 'main', 'address': '0x00401000'},
+        {'name': 'helper', 'address': '0x00401050'},
+    ]
+}
+
 
 def _make_docker_result(result_json: str | None, output_dir: str) -> CompletedProcess:
     """Write *result_json* into *output_dir*/result.json and return a fake CompletedProcess."""
@@ -130,12 +137,26 @@ class TestGhidraAnalysisPlugin:
         binary.write_bytes(b'\x7fELF')
 
         def fake_run_docker(file_path, output_dir):
-            # Do NOT write result.json
-            return CompletedProcess(args=['entrypoint'], returncode=1, stdout='error', stderr=None)
+            # Do NOT write result.json although docker reported success
+            return CompletedProcess(args=['entrypoint'], returncode=0, stdout='', stderr=None)
 
         with patch.object(analysis_plugin, '_run_ghidra_in_docker', side_effect=fake_run_docker):
             with binary.open('rb') as fh:
                 with pytest.raises(AnalysisFailedError, match='result file'):
+                    analysis_plugin.analyze(fh, {}, {})
+
+    def test_analyze_docker_non_zero_exit(self, analysis_plugin: AnalysisPlugin, tmp_path):
+        from analysis.plugin import AnalysisFailedError
+
+        binary = tmp_path / 'binary'
+        binary.write_bytes(b'\x7fELF')
+
+        def fake_run_docker(file_path, output_dir):
+            return CompletedProcess(args=['entrypoint'], returncode=1, stdout='error', stderr=None)
+
+        with patch.object(analysis_plugin, '_run_ghidra_in_docker', side_effect=fake_run_docker):
+            with binary.open('rb') as fh:
+                with pytest.raises(AnalysisFailedError, match='container execution failed'):
                     analysis_plugin.analyze(fh, {}, {})
 
     def test_analyze_docker_timeout(self, analysis_plugin: AnalysisPlugin, tmp_path):
@@ -151,3 +172,79 @@ class TestGhidraAnalysisPlugin:
             with binary.open('rb') as fh:
                 with pytest.raises(AnalysisFailedError, match='timeout'):
                     analysis_plugin.analyze(fh, {}, {})
+
+    # ------------------------------------------------------------------
+    # run_targeted_analysis()
+    # ------------------------------------------------------------------
+
+    def test_run_targeted_analysis_success(self, analysis_plugin: AnalysisPlugin, tmp_path):
+        binary = tmp_path / 'binary'
+        binary.write_bytes(b'\x7fELF')
+
+        result_json = json.dumps(SAMPLE_RESULT)
+
+        captured: dict = {}
+
+        def fake_run_docker(file_path, output_dir, entry_address=None):
+            captured['entry_address'] = entry_address
+            return _make_docker_result(result_json, output_dir)
+
+        with patch.object(analysis_plugin, '_run_ghidra_in_docker', side_effect=fake_run_docker):
+            result = analysis_plugin.run_targeted_analysis(str(binary), entry_address='0x401000')
+
+        assert isinstance(result, AnalysisPlugin.Schema)
+        assert len(result.functions) == 2
+        assert captured['entry_address'] == '0x401000'
+
+    def test_run_targeted_analysis_missing_result_file(self, analysis_plugin: AnalysisPlugin, tmp_path):
+        from analysis.plugin import AnalysisFailedError
+
+        binary = tmp_path / 'binary'
+        binary.write_bytes(b'\x7fELF')
+
+        def fake_run_docker(file_path, output_dir, entry_address=None):
+            del file_path, output_dir, entry_address
+            return CompletedProcess(args=['entrypoint'], returncode=0, stdout='', stderr=None)
+
+        with patch.object(analysis_plugin, '_run_ghidra_in_docker', side_effect=fake_run_docker):
+            with pytest.raises(AnalysisFailedError, match='result file'):
+                analysis_plugin.run_targeted_analysis(str(binary), entry_address='0x401000')
+
+    # ------------------------------------------------------------------
+    # export_entry_points()
+    # ------------------------------------------------------------------
+
+    def test_export_entry_points_success(self, analysis_plugin: AnalysisPlugin, tmp_path):
+        binary = tmp_path / 'binary'
+        binary.write_bytes(b'\x7fELF')
+
+        result_json = json.dumps(SAMPLE_ENTRY_POINTS_RESULT)
+
+        captured: dict = {}
+
+        def fake_run_docker(file_path, output_dir, entry_address=None, export_entry_points=False):
+            captured['entry_address'] = entry_address
+            captured['export_entry_points'] = export_entry_points
+            return _make_docker_result(result_json, output_dir)
+
+        with patch.object(analysis_plugin, '_run_ghidra_in_docker', side_effect=fake_run_docker):
+            result = analysis_plugin.export_entry_points(str(binary))
+
+        assert len(result) == 2
+        assert result[0].address == '0x00401000'
+        assert captured['entry_address'] is None
+        assert captured['export_entry_points'] is True
+
+    def test_export_entry_points_missing_result_file(self, analysis_plugin: AnalysisPlugin, tmp_path):
+        from analysis.plugin import AnalysisFailedError
+
+        binary = tmp_path / 'binary'
+        binary.write_bytes(b'\x7fELF')
+
+        def fake_run_docker(file_path, output_dir, entry_address=None, export_entry_points=False):
+            del file_path, output_dir, entry_address, export_entry_points
+            return CompletedProcess(args=['entrypoint'], returncode=0, stdout='', stderr=None)
+
+        with patch.object(analysis_plugin, '_run_ghidra_in_docker', side_effect=fake_run_docker):
+            with pytest.raises(AnalysisFailedError, match='result file'):
+                analysis_plugin.export_entry_points(str(binary))

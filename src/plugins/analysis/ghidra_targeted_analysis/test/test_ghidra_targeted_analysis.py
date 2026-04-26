@@ -171,12 +171,25 @@ class TestGhidraTargetedAnalysisPlugin:
         binary.write_bytes(b'\x7fELF')
 
         def fake_docker(file_path, output_dir, entry_points, sensitive_vars, max_depth):
-            # Do NOT write result.json
-            return CompletedProcess(args=['entrypoint'], returncode=1, stdout='error', stderr=None)
+            # Do NOT write result.json although docker reported success
+            return CompletedProcess(args=['entrypoint'], returncode=0, stdout='', stderr=None)
 
         with patch.object(analysis_plugin, '_run_targeted_analysis_in_docker', side_effect=fake_docker):
             with pytest.raises(AnalysisFailedError, match='result file'):
-                analysis_plugin.run_targeted_analysis(str(binary), entry_points=['main'])
+                analysis_plugin.run_targeted_analysis(str(binary), entry_points=['main'], sensitive_vars=[])
+
+    def test_run_targeted_analysis_docker_non_zero_exit(self, analysis_plugin: AnalysisPlugin, tmp_path):
+        from analysis.plugin import AnalysisFailedError
+
+        binary = tmp_path / 'binary'
+        binary.write_bytes(b'\x7fELF')
+
+        def fake_docker(file_path, output_dir, entry_points, sensitive_vars, max_depth):
+            return CompletedProcess(args=['entrypoint'], returncode=1, stdout='error', stderr=None)
+
+        with patch.object(analysis_plugin, '_run_targeted_analysis_in_docker', side_effect=fake_docker):
+            with pytest.raises(AnalysisFailedError, match='container execution failed'):
+                analysis_plugin.run_targeted_analysis(str(binary), entry_points=['main'], sensitive_vars=[])
 
     def test_run_targeted_analysis_docker_timeout(self, analysis_plugin: AnalysisPlugin, tmp_path):
         from analysis.plugin import AnalysisFailedError
@@ -189,7 +202,7 @@ class TestGhidraTargetedAnalysisPlugin:
 
         with patch.object(analysis_plugin, '_run_targeted_analysis_in_docker', side_effect=fake_docker):
             with pytest.raises(AnalysisFailedError, match='timeout'):
-                analysis_plugin.run_targeted_analysis(str(binary), entry_points=['main'])
+                analysis_plugin.run_targeted_analysis(str(binary), entry_points=['main'], sensitive_vars=[])
 
     def test_params_passed_to_docker_runner(self, analysis_plugin: AnalysisPlugin, tmp_path):
         """Parameters from run_targeted_analysis() must be forwarded to the Docker runner."""

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import tempfile
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -46,6 +47,11 @@ class FunctionInfo(BaseModel):
     callees: List[str]
 
 
+class EntryPointInfo(BaseModel):
+    name: str
+    address: str
+
+
 class AnalysisPlugin(AnalysisPluginV0):
     class Schema(BaseModel):
         functions: List[FunctionInfo]
@@ -76,7 +82,13 @@ class AnalysisPlugin(AnalysisPluginV0):
     # Docker helpers
     # ------------------------------------------------------------------
 
-    def _run_ghidra_in_docker(self, file_path: str, output_dir: str) -> CompletedProcess:
+    def _run_ghidra_in_docker(
+        self,
+        file_path: str,
+        output_dir: str,
+        entry_address: str | None = None,
+        export_entry_points: bool = False,
+    ) -> CompletedProcess:
         """Run the pyghidra analysis script inside a Docker container.
 
         *file_path* is mounted read-only as ``/input`` inside the container.
@@ -85,6 +97,10 @@ class AnalysisPlugin(AnalysisPluginV0):
         ``/scripts``.
         """
         command = 'python3 /scripts/decompile_and_callgraph.py /input /output/result.json'
+        if export_entry_points:
+            command += ' --list-entry-points'
+        if entry_address:
+            command += f' {shlex.quote(entry_address)}'
         try:
             result = run_docker_container(
                 DOCKER_IMAGE,
@@ -128,6 +144,20 @@ class AnalysisPlugin(AnalysisPluginV0):
             )
         return functions
 
+    def _parse_entry_points_output(self, result_json: str) -> list[EntryPointInfo]:
+        try:
+            data = json.loads(result_json)
+        except json.JSONDecodeError as exc:
+            raise AnalysisFailedError('Could not parse Ghidra entry points JSON') from exc
+
+        return [
+            EntryPointInfo(
+                name=entry.get('name', '<unknown>'),
+                address=entry.get('address', '0x0'),
+            )
+            for entry in data.get('entry_points', [])
+        ]
+
     # ------------------------------------------------------------------
     # Plugin interface
     # ------------------------------------------------------------------
@@ -139,12 +169,21 @@ class AnalysisPlugin(AnalysisPluginV0):
         file_path = os.path.realpath(file_handle.name)
 
         with tempfile.TemporaryDirectory(prefix='fact-ghidra-') as output_dir:
-            self._run_ghidra_in_docker(file_path, output_dir)
+            docker_result = self._run_ghidra_in_docker(file_path, output_dir)
+
+            if docker_result.returncode != 0:
+                logging.error(
+                    '[ghidra_analysis] Docker execution failed (exit_code=%s). Output:\n%s',
+                    docker_result.returncode,
+                    docker_result.stdout or '<no output>',
+                )
+                raise AnalysisFailedError('Ghidra container execution failed (see logs for details)')
 
             result_path = Path(output_dir) / 'result.json'
             if not result_path.exists():
                 logging.error(
-                    '[ghidra_analysis] result.json not found. Ghidra may have failed silently.'
+                    '[ghidra_analysis] result.json not found. Container output:\n%s',
+                    docker_result.stdout or '<no output>',
                 )
                 raise AnalysisFailedError('Ghidra did not produce a result file (see logs for details)')
 
@@ -152,6 +191,65 @@ class AnalysisPlugin(AnalysisPluginV0):
 
         functions = self._parse_ghidra_output(result_json)
         return self.Schema(functions=functions)
+
+    def run_targeted_analysis(self, file_path: str, entry_address: str) -> Schema:
+        """Run Ghidra analysis only for *entry_address* and its reachable callees."""
+        file_path = os.path.realpath(file_path)
+
+        with tempfile.TemporaryDirectory(prefix='fact-ghidra-') as output_dir:
+            docker_result = self._run_ghidra_in_docker(file_path, output_dir, entry_address=entry_address)
+
+            if docker_result.returncode != 0:
+                logging.error(
+                    '[ghidra_analysis] Targeted Docker execution failed (exit_code=%s). Output:\n%s',
+                    docker_result.returncode,
+                    docker_result.stdout or '<no output>',
+                )
+                raise AnalysisFailedError('Ghidra container execution failed (see logs for details)')
+
+            result_path = Path(output_dir) / 'result.json'
+            if not result_path.exists():
+                logging.error(
+                    '[ghidra_analysis] targeted result.json not found. Container output:\n%s',
+                    docker_result.stdout or '<no output>',
+                )
+                raise AnalysisFailedError('Ghidra did not produce a result file (see logs for details)')
+
+            result_json = result_path.read_text(encoding='utf-8')
+
+        functions = self._parse_ghidra_output(result_json)
+        return self.Schema(functions=functions)
+
+    def export_entry_points(self, file_path: str) -> list[EntryPointInfo]:
+        """Export all function entry points without decompilation."""
+        file_path = os.path.realpath(file_path)
+
+        with tempfile.TemporaryDirectory(prefix='fact-ghidra-') as output_dir:
+            docker_result = self._run_ghidra_in_docker(
+                file_path,
+                output_dir,
+                export_entry_points=True,
+            )
+
+            if docker_result.returncode != 0:
+                logging.error(
+                    '[ghidra_analysis] Entry-point export failed (exit_code=%s). Output:\n%s',
+                    docker_result.returncode,
+                    docker_result.stdout or '<no output>',
+                )
+                raise AnalysisFailedError('Ghidra container execution failed (see logs for details)')
+
+            result_path = Path(output_dir) / 'result.json'
+            if not result_path.exists():
+                logging.error(
+                    '[ghidra_analysis] entry-point result.json not found. Container output:\n%s',
+                    docker_result.stdout or '<no output>',
+                )
+                raise AnalysisFailedError('Ghidra did not produce a result file (see logs for details)')
+
+            result_json = result_path.read_text(encoding='utf-8')
+
+        return self._parse_entry_points_output(result_json)
 
     def summarize(self, result: Schema) -> list[str]:
         """Return the list of decompiled function names as a summary."""
