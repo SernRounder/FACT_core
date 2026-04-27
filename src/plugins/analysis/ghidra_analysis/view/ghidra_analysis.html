@@ -1,37 +1,45 @@
 {% extends "analysis_plugins/general_information.html" %}
 
 {% block analysis_result_details %}
-
-{% set functions = analysis_result.functions %}
-
 <tr>
-    <td colspan="4">
+    <td colspan="6">
         <div class="card border-primary">
             <div class="card-body p-3">
                 <div class="form-row align-items-end">
-                    <div class="form-group col-md-6 mb-2">
-                        <label for="ghidra-entry-address" class="mb-1"><strong>入口函数地址</strong></label>
+                    <div class="form-group col-md-5 mb-2">
+                        <label for="ghidra-function-identifier" class="mb-1"><strong>函数地址或函数名</strong></label>
                         <input
-                            id="ghidra-entry-address"
+                            id="ghidra-function-identifier"
                             type="text"
                             class="form-control"
                             list="ghidra-entry-points-list"
-                            placeholder="例如: 0x401000"
+                            placeholder="例如: 0x401000 或 main"
                         >
                         <datalist id="ghidra-entry-points-list"></datalist>
                     </div>
-                    <div class="form-group col-md-3 mb-2">
+                    <div class="form-group col-md-2 mb-2">
+                        <label for="ghidra-max-depth" class="mb-1"><strong>深度</strong></label>
+                        <input
+                            id="ghidra-max-depth"
+                            type="number"
+                            min="0"
+                            step="1"
+                            value="5"
+                            class="form-control"
+                        >
+                    </div>
+                    <div class="form-group col-md-2 mb-2">
                         <button id="ghidra-export-entry-points" class="btn btn-outline-primary btn-block" onclick="exportGhidraEntryPoints()">
                             导出入口点
                         </button>
                     </div>
                     <div class="form-group col-md-3 mb-2">
-                        <button id="ghidra-run-targeted" class="btn btn-primary btn-block" onclick="runGhidraTargetedAnalysis()">
-                            按地址分析
+                        <button id="ghidra-load-function" class="btn btn-primary btn-block" onclick="runGhidraTargetedAnalysis()">
+                            入口函数分析
                         </button>
                     </div>
                 </div>
-                <small class="text-muted">仅分析该地址对应函数及其子调用函数，不再全量分析整个文件。</small>
+                <small class="text-muted">上传固件后不会自动进行全量反编译。请输入入口函数名或地址，并指定 BFS 反编译深度后按需分析。</small>
                 <div id="ghidra-targeted-status" class="mt-2"></div>
             </div>
         </div>
@@ -39,13 +47,15 @@
 </tr>
 
 <tr id="ghidra-targeted-container" style="display:none;">
-    <td colspan="4" class="p-0">
+    <td colspan="6" class="p-0">
         <table class="table table-bordered mb-0" style="table-layout: fixed; overflow-wrap: anywhere;">
             <thead class="thead-light">
                 <tr>
                     <th>Function</th>
                     <th>Address</th>
+                    <th>Callers</th>
                     <th>Callees</th>
+                    <th>LLM Description</th>
                     <th>Pseudocode</th>
                 </tr>
             </thead>
@@ -55,50 +65,10 @@
 </tr>
 
 <tr>
-    <th colspan="4" class="table-head-light">已存储的历史结果</th>
+    <td colspan="6" class="text-muted">
+        当前插件不再在上传固件后自动执行全量分析，结果仅来自上方入口函数分析请求。
+    </td>
 </tr>
-
-{% if not functions %}
-    <tr>
-        <td colspan="4">No functions were found or the binary could not be decompiled.</td>
-    </tr>
-{% else %}
-    <tr>
-        <th>Function</th>
-        <th>Address</th>
-        <th>Callees</th>
-        <th>Pseudocode</th>
-    </tr>
-
-    {% for func in functions | sort(attribute='name') %}
-        <tr>
-            <td><code>{{ func.name }}</code></td>
-            <td><code>{{ func.address }}</code></td>
-            <td>
-                {% if func.callees %}
-                    <ul class="mb-0 pl-3">
-                        {% for callee in func.callees | sort %}
-                            <li><code>{{ callee }}</code></li>
-                        {% endfor %}
-                    </ul>
-                {% else %}
-                    <em>none</em>
-                {% endif %}
-            </td>
-            <td class="m-0 p-0">
-                <div class="clickable pt-2 pl-3"
-                     data-toggle="collapse"
-                     data-target="#pseudocode_{{ loop.index }}">
-                    <i class="fas fa-angle-down mb-2 pt-2"></i> show / hide
-                </div>
-                <div class="collapse w-100" id="pseudocode_{{ loop.index }}">
-                    <pre class="m-2 p-2" style="background:#f8f9fa; max-height:400px; overflow:auto;"><code>{{ func.pseudocode }}</code></pre>
-                </div>
-            </td>
-        </tr>
-    {% endfor %}
-{% endif %}
-
 {% endblock %}
 
 {% block ajax %}
@@ -109,29 +79,60 @@
         return div.innerHTML;
     }
 
-    function _renderCallees(callees) {
-        if (!Array.isArray(callees) || callees.length === 0) {
+    function _renderNameList(items) {
+        if (!Array.isArray(items) || items.length === 0) {
             return '<em>none</em>';
         }
-        const items = [...callees].sort().map((callee) => `<li><code>${_escapeHtml(callee)}</code></li>`).join('');
-        return `<ul class="mb-0 pl-3">${items}</ul>`;
+        const values = [...items].sort().map((item) => `<li><code>${_escapeHtml(item)}</code></li>`).join('');
+        return `<ul class="mb-0 pl-3">${values}</ul>`;
+    }
+
+    function _isTimeoutMessage(message) {
+        const normalized = String(message || '').toLowerCase();
+        return normalized.includes('timeout') || normalized.includes('timed out') || normalized.includes('possible timeout');
+    }
+
+    function _renderRequestError(statusElement, message, fallbackMessage) {
+        const resolvedMessage = _escapeHtml(message || fallbackMessage);
+        const alertClass = _isTimeoutMessage(message) ? 'alert-warning' : 'alert-danger';
+        const prefix = _isTimeoutMessage(message) ? '请求超时：' : '请求错误：';
+        statusElement.innerHTML = `<div class="alert ${alertClass} mb-0">${prefix}${resolvedMessage}</div>`;
+    }
+
+    async function _readErrorResponse(response, fallbackMessage) {
+        let data = null;
+        try {
+            data = await response.json();
+        } catch (error) {
+            data = null;
+        }
+
+        if (data && typeof data.error_message === 'string' && data.error_message.trim()) {
+            return {data, message: data.error_message.trim()};
+        }
+
+        const statusText = response.statusText ? ` (${response.statusText})` : '';
+        return {data, message: `${fallbackMessage} [HTTP ${response.status}${statusText}]`};
     }
 
     function _renderFunctionRows(functions) {
         const sorted = [...functions].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
         return sorted.map((func, index) => {
-            const collapseId = `targeted_pseudocode_${index}`;
+            const collapseId = `ghidra_pseudocode_${index}`;
+            const llmDescription = func.llm_description ? _escapeHtml(func.llm_description) : '<em>pending</em>';
             return `
                 <tr>
                     <td><code>${_escapeHtml(func.name || '<unknown>')}</code></td>
                     <td><code>${_escapeHtml(func.address || '0x0')}</code></td>
-                    <td>${_renderCallees(func.callees || [])}</td>
+                    <td>${_renderNameList(func.callers || [])}</td>
+                    <td>${_renderNameList(func.callees || [])}</td>
+                    <td>${llmDescription}</td>
                     <td class="m-0 p-0">
                         <div class="clickable pt-2 pl-3" data-toggle="collapse" data-target="#${collapseId}">
                             <i class="fas fa-angle-down mb-2 pt-2"></i> show / hide
                         </div>
                         <div class="collapse w-100" id="${collapseId}">
-                            <pre class="m-2 p-2" style="background:#f8f9fa; max-height:400px; overflow:auto;"><code>${_escapeHtml(func.pseudocode || '')}</code></pre>
+                            <pre class="m-2 p-2" style="background:#f8f9fa; max-height:500px; overflow:auto;"><code>${_escapeHtml(func.pseudocode || '')}</code></pre>
                         </div>
                     </td>
                 </tr>
@@ -145,7 +146,7 @@
         const sorted = [...entryPoints].sort((a, b) => (a.address || '').localeCompare(b.address || ''));
         for (const entry of sorted) {
             const option = document.createElement('option');
-            option.value = entry.address || '';
+            option.value = entry.address || entry.name || '';
             option.label = `${entry.name || '<unknown>'} (${entry.address || '0x0'})`;
             list.appendChild(option);
         }
@@ -165,8 +166,7 @@
             const data = await response.json();
 
             if (!response.ok || data.status !== 0) {
-                const message = _escapeHtml(data.error_message || '导出入口点失败');
-                status.innerHTML = `<div class="alert alert-danger mb-0">${message}</div>`;
+                _renderRequestError(status, data.error_message, '导出入口点失败');
                 return;
             }
 
@@ -174,7 +174,7 @@
             _renderEntryPointOptions(entryPoints);
             status.innerHTML = `<div class="alert alert-success mb-0">已导出 ${entryPoints.length} 个入口点，可在输入框直接选择地址。</div>`;
         } catch (error) {
-            status.innerHTML = '<div class="alert alert-danger mb-0">请求失败，请稍后重试。</div>';
+            _renderRequestError(status, error && error.message, '导出入口点失败');
             console.error(error);
         } finally {
             button.disabled = false;
@@ -182,20 +182,27 @@
     }
 
     async function runGhidraTargetedAnalysis() {
-        const input = document.getElementById('ghidra-entry-address');
+        const input = document.getElementById('ghidra-function-identifier');
+        const depthInput = document.getElementById('ghidra-max-depth');
         const status = document.getElementById('ghidra-targeted-status');
         const resultsBody = document.getElementById('ghidra-targeted-results');
         const container = document.getElementById('ghidra-targeted-container');
-        const button = document.getElementById('ghidra-run-targeted');
+        const button = document.getElementById('ghidra-load-function');
 
-        const entryAddress = (input.value || '').trim();
-        if (!entryAddress) {
-            status.innerHTML = '<div class="alert alert-warning mb-0">请输入入口地址（例如 0x401000）。</div>';
+        const functionIdentifier = (input.value || '').trim();
+        const maxDepth = Number.parseInt(depthInput.value || '5', 10);
+
+        if (!functionIdentifier) {
+            status.innerHTML = '<div class="alert alert-warning mb-0">请输入函数地址或函数名。</div>';
+            return;
+        }
+        if (!Number.isInteger(maxDepth) || maxDepth < 0) {
+            status.innerHTML = '<div class="alert alert-warning mb-0">请输入非负整数深度。</div>';
             return;
         }
 
         button.disabled = true;
-        status.innerHTML = '<div class="alert alert-info mb-0"><i class="fas fa-spinner fa-spin"></i> 正在调用 Ghidra 进行按地址分析...</div>';
+        status.innerHTML = '<div class="alert alert-info mb-0"><i class="fas fa-spinner fa-spin"></i> 正在提交入口函数分析任务...</div>';
         resultsBody.innerHTML = '';
         container.style.display = 'none';
 
@@ -203,27 +210,39 @@
             const response = await fetch(`/plugins/ghidra_analysis/rest/${uid}`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({entry_address: entryAddress}),
+                body: JSON.stringify({function_identifier: functionIdentifier, max_depth: maxDepth}),
             });
-            const data = await response.json();
+            const {data, message} = response.ok
+                ? {data: await response.json(), message: ''}
+                : await _readErrorResponse(response, '查询函数详情失败');
 
-            if (!response.ok || data.status !== 0) {
-                const message = _escapeHtml(data.error_message || '分析失败');
-                status.innerHTML = `<div class="alert alert-danger mb-0">${message}</div>`;
+            if (!response.ok) {
+                _renderRequestError(status, message, '查询函数详情失败');
                 return;
             }
 
-            const functions = (data.result && data.result.functions) ? data.result.functions : [];
+            if (data.status !== 0) {
+                _renderRequestError(status, data.error_message, '查询函数详情失败');
+                return;
+            }
+
+            if (data.in_progress) {
+                const pendingMessage = _escapeHtml(data.message || '分析任务正在后台执行，请稍后重试。');
+                status.innerHTML = `<div class="alert alert-info mb-0">${pendingMessage}</div>`;
+                return;
+            }
+
+            const functions = data.result && Array.isArray(data.result.functions) ? data.result.functions : [];
             if (functions.length === 0) {
-                status.innerHTML = '<div class="alert alert-warning mb-0">未找到该地址对应函数，或该函数无可解析的子调用。</div>';
+                status.innerHTML = '<div class="alert alert-warning mb-0">未找到对应入口函数，或在给定深度内没有可分析函数。</div>';
                 return;
             }
 
             container.style.display = '';
             resultsBody.innerHTML = _renderFunctionRows(functions);
-            status.innerHTML = `<div class="alert alert-success mb-0">分析完成，共 ${functions.length} 个函数。</div>`;
+            status.innerHTML = `<div class="alert alert-success mb-0">分析完成，共返回 ${functions.length} 个函数。</div>`;
         } catch (error) {
-            status.innerHTML = '<div class="alert alert-danger mb-0">请求失败，请稍后重试。</div>';
+            _renderRequestError(status, error && error.message, '查询函数详情失败');
             console.error(error);
         } finally {
             button.disabled = false;

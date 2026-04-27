@@ -1,43 +1,49 @@
 """
-This plugin uses Ghidra to decompile binary files extracted from firmware images.
-For each function it stores the decompiled pseudocode and the list of called functions
-(call graph). This data can be used for further automated analysis.
+Targeted Ghidra analysis plugin.
 
-Ghidra is run inside a Docker container via the **pyghidra** Python bridge.  The
-container receives the binary via a bind-mount, runs a Python analysis script
-(``decompile_and_callgraph.py``) that emits a JSON result file, and the plugin then
-parses that result.
+This plugin no longer performs a full automatic decompilation during firmware
+upload. Instead, users trigger targeted analysis on demand by providing a
+function name or address. Starting from that function, reachable child
+functions are explored breadth-first and decompiled up to a configurable
+depth.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
-import shlex
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 from subprocess import CompletedProcess
+from threading import Lock
 from typing import TYPE_CHECKING, List
+from uuid import uuid4
 
+import docker
 from docker.types import Mount
+from docker.errors import APIError, DockerException, NotFound
 from pydantic import BaseModel
 from requests import RequestException
 from semver import Version
 
 import config
 from analysis.plugin import AnalysisFailedError, AnalysisPluginV0
-from helperFunctions.docker import run_docker_container
 
 if TYPE_CHECKING:
     from io import FileIO
 
 DOCKER_IMAGE = 'ghidra-fact:latest'
 GHIDRA_SCRIPTS_DIR = str(Path(__file__).parent.parent / 'ghidra_scripts')
-
-# Maximum number of characters kept per function's pseudocode to avoid
-# storing excessively large blobs in the database.
 DEFAULT_MAX_PSEUDOCODE_LENGTH = 10_000
+DEFAULT_MAX_DEPTH = 5
+GHIDRA_CONTAINER_PREFIX = 'fact-ghidra'
+GHIDRA_CONTAINER_CACHE_DIR = Path(tempfile.gettempdir()) / 'fact-ghidra'
+
+_CONTAINER_LOCKS: dict[str, Lock] = {}
+_CONTAINER_LOCKS_GUARD = Lock()
 
 
 class FunctionInfo(BaseModel):
@@ -45,6 +51,9 @@ class FunctionInfo(BaseModel):
     address: str
     pseudocode: str
     callees: List[str]
+    callers: List[str] = []
+    llm_description: str = ''
+    llm_description_prompt: str = ''
 
 
 class EntryPointInfo(BaseModel):
@@ -61,8 +70,9 @@ class AnalysisPlugin(AnalysisPluginV0):
             metadata=self.MetaData(
                 name='ghidra_analysis',
                 description=(
-                    'Decompiles binary files using Ghidra and stores the resulting pseudocode '
-                    'together with the call graph (callee list per function) for further analysis.'
+                    'Provides targeted Ghidra decompilation starting from a user-supplied function '
+                    'entry. Reachable child functions are explored breadth-first and decompiled '
+                    'up to a configurable depth.'
                 ),
                 dependencies=['file_type'],
                 mime_whitelist=[
@@ -72,56 +82,109 @@ class AnalysisPlugin(AnalysisPluginV0):
                 ],
                 version=Version(1, 0, 0),
                 Schema=self.Schema,
-                timeout=600,
+                timeout=60000,
             )
         )
         plugin_cfg = config.backend.plugin.get(self.metadata.name, None)
         self.max_pseudocode_length: int = getattr(plugin_cfg, 'max_pseudocode_length', DEFAULT_MAX_PSEUDOCODE_LENGTH)
+        self.default_max_depth: int = getattr(plugin_cfg, 'max_depth', DEFAULT_MAX_DEPTH)
 
-    # ------------------------------------------------------------------
-    # Docker helpers
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _container_lock(container_name: str) -> Lock:
+        with _CONTAINER_LOCKS_GUARD:
+            return _CONTAINER_LOCKS.setdefault(container_name, Lock())
+
+    @staticmethod
+    def _build_container_name(file_path: str) -> str:
+        digest = hashlib.sha256(os.path.realpath(file_path).encode(encoding='utf-8')).hexdigest()[:24]
+        return f'{GHIDRA_CONTAINER_PREFIX}-{digest}'
+
+    def _get_reusable_container_output_dir(self, container_name: str) -> Path:
+        output_dir = GHIDRA_CONTAINER_CACHE_DIR / container_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir
+
+    def _create_reusable_container(self, client, file_path: str, container_name: str):
+        host_output_dir = self._get_reusable_container_output_dir(container_name)
+        return client.containers.run(
+            DOCKER_IMAGE,
+            name=container_name,
+            command=['tail', '-f', '/dev/null'],
+            detach=True,
+            mounts=[
+                Mount('/input', file_path, type='bind', read_only=True),
+                Mount('/output', str(host_output_dir), type='bind'),
+                Mount('/scripts', GHIDRA_SCRIPTS_DIR, type='bind', read_only=True),
+            ],
+            labels={
+                'fact.role': 'ghidra-analysis',
+                'fact.binary_path_sha256': hashlib.sha256(os.path.realpath(file_path).encode(encoding='utf-8')).hexdigest(),
+            },
+        )
+
+    def _get_or_create_reusable_container(self, file_path: str):
+        client = docker.from_env()
+        container_name = self._build_container_name(file_path)
+        lock = self._container_lock(container_name)
+
+        with lock:
+            try:
+                container = client.containers.get(container_name)
+                container.reload()
+                if container.status != 'running':
+                    with suppress(DockerException):
+                        container.remove(force=True)
+                    container = self._create_reusable_container(client, file_path, container_name)
+            except NotFound:
+                container = self._create_reusable_container(client, file_path, container_name)
+            except APIError:
+                logging.warning('[ghidra_analysis] Docker error while preparing reusable container')
+                raise
+
+        return container_name, container, self._get_reusable_container_output_dir(container_name)
 
     def _run_ghidra_in_docker(
         self,
         file_path: str,
         output_dir: str,
-        entry_address: str | None = None,
+        function_identifier: str | None = None,
         export_entry_points: bool = False,
+        max_depth: int | None = None,
     ) -> CompletedProcess:
-        """Run the pyghidra analysis script inside a Docker container.
-
-        *file_path* is mounted read-only as ``/input`` inside the container.
-        *output_dir* is mounted as ``/output`` so the Python script can write
-        ``result.json`` there.  The Ghidra scripts directory is mounted as
-        ``/scripts``.
-        """
-        command = 'python3 /scripts/decompile_and_callgraph.py /input /output/result.json'
+        command_parts = ['python3', '/scripts/decompile_and_callgraph.py']
         if export_entry_points:
-            command += ' --list-entry-points'
-        if entry_address:
-            command += f' {shlex.quote(entry_address)}'
-        try:
-            result = run_docker_container(
-                DOCKER_IMAGE,
-                combine_stderr_stdout=True,
-                timeout=self.metadata.timeout - 30,
-                command=command,
-                mounts=[
-                    Mount('/input', file_path, type='bind', read_only=True),
-                    Mount('/output', output_dir, type='bind'),
-                    Mount('/scripts', GHIDRA_SCRIPTS_DIR, type='bind', read_only=True),
-                ],
-            )
-        except RequestException as exc:
-            raise AnalysisFailedError(
-                'No response from Ghidra Docker container (possible timeout)'
-            ) from exc
-        return result
+            command_parts.append('--list-entry-points')
+        if function_identifier and max_depth is not None:
+            command_parts.extend(['--max-depth', str(max_depth)])
+        result_name = f'result-{uuid4().hex}.json'
+        command_parts.extend(['/input', f'/output/{result_name}'])
+        if function_identifier:
+            command_parts.append(function_identifier)
 
-    # ------------------------------------------------------------------
-    # Result parsing
-    # ------------------------------------------------------------------
+        try:
+            container_name, container, reusable_output_dir = self._get_or_create_reusable_container(file_path)
+        except RequestException as exc:
+            raise AnalysisFailedError('No response from Ghidra Docker container (possible timeout)') from exc
+
+        lock = self._container_lock(container_name)
+        host_result_path = reusable_output_dir / result_name
+        host_result_path.unlink(missing_ok=True)
+
+        with lock:
+            try:
+                exec_result = container.exec_run(command_parts, stdout=True, stderr=True)
+            except (APIError, RequestException) as exc:
+                raise AnalysisFailedError('No response from Ghidra Docker container (possible timeout)') from exc
+
+        stdout = exec_result.output.decode(errors='replace') if isinstance(exec_result.output, bytes) else str(exec_result.output)
+        result = CompletedProcess(args=['entrypoint', *command_parts], returncode=exec_result.exit_code, stdout=stdout, stderr=None)
+
+        if host_result_path.exists():
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(output_dir) / 'result.json').write_text(host_result_path.read_text(encoding='utf-8'), encoding='utf-8')
+            host_result_path.unlink(missing_ok=True)
+
+        return result
 
     def _parse_ghidra_output(self, result_json: str) -> list[FunctionInfo]:
         try:
@@ -140,6 +203,9 @@ class AnalysisPlugin(AnalysisPluginV0):
                     address=func.get('address', '0x0'),
                     pseudocode=pseudocode,
                     callees=func.get('callees', []),
+                    callers=func.get('callers', []),
+                    llm_description=func.get('llm_description', ''),
+                    llm_description_prompt=func.get('llm_description_prompt', ''),
                 )
             )
         return functions
@@ -158,46 +224,22 @@ class AnalysisPlugin(AnalysisPluginV0):
             for entry in data.get('entry_points', [])
         ]
 
-    # ------------------------------------------------------------------
-    # Plugin interface
-    # ------------------------------------------------------------------
-
     def analyze(self, file_handle: FileIO, virtual_file_path: dict, analyses: dict) -> Schema:
-        """Decompile the binary with Ghidra and return pseudocode + call graph."""
-        del virtual_file_path, analyses
+        """Automatic analysis is disabled; targeted analysis is triggered on demand."""
+        del file_handle, virtual_file_path, analyses
+        return self.Schema(functions=[])
 
-        file_path = os.path.realpath(file_handle.name)
-
-        with tempfile.TemporaryDirectory(prefix='fact-ghidra-') as output_dir:
-            docker_result = self._run_ghidra_in_docker(file_path, output_dir)
-
-            if docker_result.returncode != 0:
-                logging.error(
-                    '[ghidra_analysis] Docker execution failed (exit_code=%s). Output:\n%s',
-                    docker_result.returncode,
-                    docker_result.stdout or '<no output>',
-                )
-                raise AnalysisFailedError('Ghidra container execution failed (see logs for details)')
-
-            result_path = Path(output_dir) / 'result.json'
-            if not result_path.exists():
-                logging.error(
-                    '[ghidra_analysis] result.json not found. Container output:\n%s',
-                    docker_result.stdout or '<no output>',
-                )
-                raise AnalysisFailedError('Ghidra did not produce a result file (see logs for details)')
-
-            result_json = result_path.read_text(encoding='utf-8')
-
-        functions = self._parse_ghidra_output(result_json)
-        return self.Schema(functions=functions)
-
-    def run_targeted_analysis(self, file_path: str, entry_address: str) -> Schema:
-        """Run Ghidra analysis only for *entry_address* and its reachable callees."""
+    def run_targeted_analysis(self, file_path: str, function_identifier: str, max_depth: int | None = None) -> Schema:
         file_path = os.path.realpath(file_path)
+        max_depth = self.default_max_depth if max_depth is None else max_depth
 
         with tempfile.TemporaryDirectory(prefix='fact-ghidra-') as output_dir:
-            docker_result = self._run_ghidra_in_docker(file_path, output_dir, entry_address=entry_address)
+            docker_result = self._run_ghidra_in_docker(
+                file_path,
+                output_dir,
+                function_identifier=function_identifier,
+                max_depth=max_depth,
+            )
 
             if docker_result.returncode != 0:
                 logging.error(
@@ -217,11 +259,9 @@ class AnalysisPlugin(AnalysisPluginV0):
 
             result_json = result_path.read_text(encoding='utf-8')
 
-        functions = self._parse_ghidra_output(result_json)
-        return self.Schema(functions=functions)
+        return self.Schema(functions=self._parse_ghidra_output(result_json))
 
     def export_entry_points(self, file_path: str) -> list[EntryPointInfo]:
-        """Export all function entry points without decompilation."""
         file_path = os.path.realpath(file_path)
 
         with tempfile.TemporaryDirectory(prefix='fact-ghidra-') as output_dir:
@@ -252,5 +292,4 @@ class AnalysisPlugin(AnalysisPluginV0):
         return self._parse_entry_points_output(result_json)
 
     def summarize(self, result: Schema) -> list[str]:
-        """Return the list of decompiled function names as a summary."""
         return [f.name for f in result.functions] if result else []
