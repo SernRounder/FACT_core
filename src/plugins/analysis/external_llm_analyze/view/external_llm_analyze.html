@@ -1,0 +1,271 @@
+{% extends "analysis_plugins/general_information.html" %}
+
+{% block analysis_result_details %}
+
+{# ------------------------------------------------------------------ #}
+{# Secondary-DB lookup panel (top of page)                            #}
+{# ------------------------------------------------------------------ #}
+<tr>
+    <td colspan="6">
+        <div class="card border-info mb-2">
+            <div class="card-header bg-info text-white py-2">
+                <strong>从辅助知识库中查询函数</strong>
+            </div>
+            <div class="card-body p-3">
+                <div class="form-row align-items-end">
+                    <div class="form-group col-md-4 mb-2">
+                        <label for="llm-query-type" class="mb-1"><strong>查询方式</strong></label>
+                        <select id="llm-query-type" class="form-control">
+                            <option value="function_name">函数名</option>
+                            <option value="function_address">函数地址</option>
+                        </select>
+                    </div>
+                    <div class="form-group col-md-5 mb-2">
+                        <label for="llm-query-value" class="mb-1"><strong>查询值</strong></label>
+                        <input
+                            id="llm-query-value"
+                            type="text"
+                            class="form-control"
+                            list="llm-function-list"
+                            placeholder="输入函数名或地址"
+                        >
+                        <datalist id="llm-function-list"></datalist>
+                    </div>
+                    <div class="form-group col-md-3 mb-2">
+                        <button
+                            id="llm-query-btn"
+                            class="btn btn-info btn-block"
+                            onclick="querySecondaryDb()"
+                        >
+                            查询辅助库
+                        </button>
+                    </div>
+                </div>
+                <div id="llm-query-status" class="mt-2"></div>
+            </div>
+        </div>
+    </td>
+</tr>
+
+{# Secondary-DB query results #}
+<tr id="llm-secondary-container" style="display:none;">
+    <td colspan="6" class="p-0">
+        <div class="card border-info mb-2">
+            <div class="card-header py-2"><strong>辅助库查询结果</strong></div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-sm table-bordered mb-0" style="table-layout:fixed; overflow-wrap:anywhere;">
+                        <thead class="thead-light">
+                            <tr>
+                                <th style="width:15%">集合 / Collection</th>
+                                <th style="width:15%">函数名</th>
+                                <th style="width:10%">地址</th>
+                                <th style="width:20%">Callee</th>
+                                <th style="width:15%">LLM 评论</th>
+                                <th style="width:25%">伪代码</th>
+                            </tr>
+                        </thead>
+                        <tbody id="llm-secondary-results"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </td>
+</tr>
+
+{# ------------------------------------------------------------------ #}
+{# Primary-DB results (current binary's function records)             #}
+{# ------------------------------------------------------------------ #}
+<tr>
+    <td colspan="6">
+        <div class="card border-primary">
+            <div class="card-header bg-primary text-white py-2">
+                <strong>当前二进制文件的逆向分析数据（主库）</strong>
+                <small class="ml-2">MongoDB 集合：<code id="llm-collection-name"></code></small>
+            </div>
+            <div class="card-body p-0">
+                <div id="llm-primary-status" class="p-3"></div>
+                <div class="table-responsive">
+                    <table class="table table-sm table-bordered mb-0" id="llm-primary-table" style="table-layout:fixed; overflow-wrap:anywhere; display:none;">
+                        <thead class="thead-light">
+                            <tr>
+                                <th style="width:15%">函数名</th>
+                                <th style="width:10%">地址</th>
+                                <th style="width:20%">Callee</th>
+                                <th style="width:15%">LLM 评论</th>
+                                <th style="width:40%">伪代码</th>
+                            </tr>
+                        </thead>
+                        <tbody id="llm-primary-results"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </td>
+</tr>
+
+{% endblock %}
+
+{% block ajax %}
+<script>
+    // ----------------------------------------------------------------
+    // Utilities
+    // ----------------------------------------------------------------
+    function _escapeHtml(value) {
+        const div = document.createElement('div');
+        div.textContent = value ?? '';
+        return div.innerHTML;
+    }
+
+    function _renderCalleeList(items) {
+        if (!Array.isArray(items) || items.length === 0) {
+            return '<em class="text-muted">none</em>';
+        }
+        return [...items].sort()
+            .map((item) => `<li><code>${_escapeHtml(item)}</code></li>`)
+            .join('');
+    }
+
+    function _renderPseudocode(code, index) {
+        const collapseId = `llm_pseudo_${index}`;
+        return `
+            <div class="clickable pt-1 pl-2" data-toggle="collapse" data-target="#${collapseId}" style="cursor:pointer;">
+                <i class="fas fa-angle-down"></i> show / hide
+            </div>
+            <div class="collapse" id="${collapseId}">
+                <pre class="m-1 p-2" style="background:#f8f9fa; max-height:400px; overflow:auto;"><code>${_escapeHtml(code || '')}</code></pre>
+            </div>
+        `;
+    }
+
+    // ----------------------------------------------------------------
+    // Primary MongoDB – load on page ready
+    // ----------------------------------------------------------------
+    async function loadPrimaryData() {
+        const statusEl = document.getElementById('llm-primary-status');
+        const tableEl  = document.getElementById('llm-primary-table');
+        const bodyEl   = document.getElementById('llm-primary-results');
+        const nameEl   = document.getElementById('llm-collection-name');
+
+        statusEl.innerHTML = '<div class="alert alert-info mb-0"><i class="fas fa-spinner fa-spin"></i> 正在从主库加载数据…</div>';
+
+        try {
+            const response = await fetch(`/plugins/external_llm_analyze/rest/${uid}`, {method: 'GET'});
+            const data = await response.json();
+
+            if (!response.ok || data.status !== 0) {
+                const msg = _escapeHtml(data.error_message || `HTTP ${response.status}`);
+                statusEl.innerHTML = `<div class="alert alert-danger mb-0">加载失败：${msg}</div>`;
+                return;
+            }
+
+            const documents = Array.isArray(data.documents) ? data.documents : [];
+            nameEl.textContent = uid;
+
+            if (documents.length === 0) {
+                statusEl.innerHTML = '<div class="alert alert-warning mb-0">主库中暂无该二进制文件的函数记录。</div>';
+                return;
+            }
+
+            // Populate datalist for secondary query
+            const list = document.getElementById('llm-function-list');
+            list.innerHTML = '';
+            documents.forEach((doc) => {
+                const name = doc.function_name;
+                const addr = doc.function_address;
+                if (name) {
+                    const opt = document.createElement('option');
+                    opt.value = name;
+                    opt.label = addr ? `${name} (${addr})` : name;
+                    list.appendChild(opt);
+                }
+            });
+
+            bodyEl.innerHTML = documents.map((doc, i) => `
+                <tr>
+                    <td><code>${_escapeHtml(doc.function_name || '')}</code></td>
+                    <td><code>${_escapeHtml(doc.function_address || '')}</code></td>
+                    <td><ul class="mb-0 pl-3">${_renderCalleeList(doc.callee)}</ul></td>
+                    <td>${_escapeHtml(doc.llm_comment || '')}</td>
+                    <td class="m-0 p-0">${_renderPseudocode(doc.pseudocode, i)}</td>
+                </tr>
+            `).join('');
+
+            tableEl.style.display = '';
+            statusEl.innerHTML = `<div class="alert alert-success mb-0 m-2">共 ${documents.length} 条函数记录。</div>`;
+        } catch (err) {
+            statusEl.innerHTML = `<div class="alert alert-danger mb-0">请求出错：${_escapeHtml(err && err.message)}</div>`;
+            console.error(err);
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Secondary MongoDB – on-demand query
+    // ----------------------------------------------------------------
+    async function querySecondaryDb() {
+        const queryType  = document.getElementById('llm-query-type').value;
+        const queryValue = (document.getElementById('llm-query-value').value || '').trim();
+        const statusEl   = document.getElementById('llm-query-status');
+        const container  = document.getElementById('llm-secondary-container');
+        const bodyEl     = document.getElementById('llm-secondary-results');
+        const btn        = document.getElementById('llm-query-btn');
+
+        if (!queryValue) {
+            statusEl.innerHTML = '<div class="alert alert-warning mb-0">请输入查询值。</div>';
+            return;
+        }
+
+        btn.disabled = true;
+        statusEl.innerHTML = '<div class="alert alert-info mb-0"><i class="fas fa-spinner fa-spin"></i> 正在查询辅助库…</div>';
+        container.style.display = 'none';
+
+        const body = {};
+        body[queryType] = queryValue;
+
+        try {
+            const response = await fetch('/plugins/external_llm_analyze/rest/secondary', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body),
+            });
+            const data = await response.json();
+
+            if (!response.ok || data.status !== 0) {
+                const msg = _escapeHtml(data.error_message || `HTTP ${response.status}`);
+                statusEl.innerHTML = `<div class="alert alert-danger mb-0">查询失败：${msg}</div>`;
+                return;
+            }
+
+            const documents = Array.isArray(data.documents) ? data.documents : [];
+            if (documents.length === 0) {
+                statusEl.innerHTML = '<div class="alert alert-warning mb-0">辅助库中未找到匹配的记录。</div>';
+                return;
+            }
+
+            bodyEl.innerHTML = documents.map((doc, i) => `
+                <tr>
+                    <td><code>${_escapeHtml(doc._collection || '')}</code></td>
+                    <td><code>${_escapeHtml(doc.function_name || '')}</code></td>
+                    <td><code>${_escapeHtml(doc.function_address || '')}</code></td>
+                    <td><ul class="mb-0 pl-3">${_renderCalleeList(doc.callee)}</ul></td>
+                    <td>${_escapeHtml(doc.llm_comment || '')}</td>
+                    <td class="m-0 p-0">${_renderPseudocode(doc.pseudocode, 's' + i)}</td>
+                </tr>
+            `).join('');
+
+            container.style.display = '';
+            statusEl.innerHTML = `<div class="alert alert-success mb-0">共找到 ${documents.length} 条匹配记录。</div>`;
+        } catch (err) {
+            statusEl.innerHTML = `<div class="alert alert-danger mb-0">请求出错：${_escapeHtml(err && err.message)}</div>`;
+            console.error(err);
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Init
+    // ----------------------------------------------------------------
+    document.addEventListener('DOMContentLoaded', loadPrimaryData);
+</script>
+{% endblock %}
