@@ -42,6 +42,9 @@ _DEFAULT_SECONDARY_DB = 'external_llm_secondary'
 
 _MONGO_TIMEOUT_MS = 5_000
 
+# Module-level client cache so connections are reused across calls.
+_mongo_clients: dict = {}
+
 
 def get_primary_mongo_uri() -> str:
     return os.environ.get('EXTERNAL_LLM_PRIMARY_MONGO_URI', _DEFAULT_PRIMARY_URI)
@@ -59,20 +62,25 @@ def get_secondary_db_name() -> str:
     return os.environ.get('EXTERNAL_LLM_SECONDARY_DB_NAME', _DEFAULT_SECONDARY_DB)
 
 
-def get_primary_collection(uid: str):
-    """Return a pymongo Collection for *uid* in the primary database."""
+def _get_or_create_client(uri: str):
+    """Return a cached pymongo MongoClient for *uri*, creating one if necessary."""
     import pymongo  # noqa: PLC0415
 
-    client = pymongo.MongoClient(get_primary_mongo_uri(), serverSelectionTimeoutMS=_MONGO_TIMEOUT_MS)
+    if uri not in _mongo_clients:
+        _mongo_clients[uri] = pymongo.MongoClient(uri, serverSelectionTimeoutMS=_MONGO_TIMEOUT_MS)
+    return _mongo_clients[uri]
+
+
+def get_primary_collection(uid: str):
+    """Return a pymongo Collection for *uid* in the primary database."""
+    client = _get_or_create_client(get_primary_mongo_uri())
     return client[get_primary_db_name()][uid]
 
 
-def get_secondary_collection(collection_name: str):
-    """Return a pymongo Collection from the secondary database."""
-    import pymongo  # noqa: PLC0415
-
-    client = pymongo.MongoClient(get_secondary_mongo_uri(), serverSelectionTimeoutMS=_MONGO_TIMEOUT_MS)
-    return client[get_secondary_db_name()][collection_name]
+def get_secondary_db():
+    """Return the pymongo Database object for the secondary database."""
+    client = _get_or_create_client(get_secondary_mongo_uri())
+    return client[get_secondary_db_name()]
 
 
 class AnalysisPlugin(AnalysisPluginV0):
@@ -108,7 +116,7 @@ class AnalysisPlugin(AnalysisPluginV0):
 
         try:
             stored_count = self._store_records(collection_name, records)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001  – pymongo raises various subclasses
             logging.error('[%s] Failed to store records for %s: %s', PLUGIN_NAME, uid, exc)
             return self.Schema(
                 mongo_collection=collection_name,

@@ -59,7 +59,7 @@ class PluginRestRoutes(RestResourceBase):
 
             collection = get_primary_collection(uid)
             documents = list(collection.find({}, {'_id': 0}))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001  – pymongo raises various subclasses
             logging.exception('[%s] Failed to query primary MongoDB for uid=%s', PLUGIN_NAME, uid)
             return error_message(
                 f'Failed to query primary MongoDB: {exc}',
@@ -111,16 +111,10 @@ class PluginRestRoutes(RestResourceBase):
 
         try:
             from plugins.analysis.external_llm_analyze.code.external_llm_analyze import (  # noqa: PLC0415
-                get_secondary_db_name,
-                get_secondary_mongo_uri,
+                get_secondary_db,
             )
-            import pymongo  # noqa: PLC0415
 
-            client = pymongo.MongoClient(
-                get_secondary_mongo_uri(), serverSelectionTimeoutMS=5_000
-            )
-            db = client[get_secondary_db_name()]
-
+            db = get_secondary_db()
             collections_to_search = [collection_name] if collection_name else db.list_collection_names()
 
             documents: list[dict] = []
@@ -129,7 +123,7 @@ class PluginRestRoutes(RestResourceBase):
                     doc['_collection'] = col
                     documents.append(doc)
 
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001  – pymongo raises various subclasses
             logging.exception('[%s] Failed to query secondary MongoDB', PLUGIN_NAME)
             return error_message(
                 f'Failed to query secondary MongoDB: {exc}',
