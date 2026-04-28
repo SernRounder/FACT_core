@@ -32,8 +32,8 @@ Examples
 --------
 Fetch a specific binary and save it as ``/tmp/target.bin``:
 
-    python fetch_binary.py \\
-        abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678_4 \\
+    python fetch_binary.py \
+        abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678_4 \
         -o /tmp/target.bin
 
 List all stored binaries:
@@ -202,7 +202,8 @@ def main() -> None:
             if not uids:
                 print('No binaries stored in MongoDB.')
             else:
-                print(f'Found {len(uids)} stored binary/binaries:')
+                noun = 'binary' if len(uids) == 1 else 'binaries'
+                print(f'Found {len(uids)} stored {noun}:')
                 for uid in uids:
                     print(f'  {uid}')
             return

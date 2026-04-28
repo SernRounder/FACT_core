@@ -229,7 +229,7 @@ class AnalysisPlugin(AnalysisPluginV0):
         fs = get_gridfs_bucket()
         # Remove any previous version for this uid.
         for existing in fs.find({'filename': uid}):
-            fs.delete(existing._id)  # noqa: SLF001
+            fs.delete(existing['_id'])
 
         file_handle.seek(0)
         data = file_handle.read()

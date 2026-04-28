@@ -168,7 +168,7 @@ class TestExternalLlmAnalyze:
     def test_store_binary_replaces_existing(self, analysis_plugin: AnalysisPlugin):
         """_store_binary deletes old GridFS entries before inserting the new one."""
         old_entry = MagicMock()
-        old_entry._id = 'old_id'  # noqa: SLF001
+        old_entry.__getitem__ = MagicMock(return_value='old_id')
 
         mock_fs = MagicMock()
         mock_fs.find.return_value = [old_entry]
