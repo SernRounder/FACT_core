@@ -15,15 +15,25 @@ class TestExternalLlmAnalyze:
         assert analysis_plugin.metadata.name == 'external_llm_analyze'
         assert analysis_plugin.metadata.version is not None
 
+    # ------------------------------------------------------------------
+    # analyze() – function records
+    # ------------------------------------------------------------------
+
     def test_analyze_stores_placeholder_when_no_ghidra(self, analysis_plugin: AnalysisPlugin):
         """When no ghidra_analysis results are present a placeholder is written to MongoDB."""
         mock_collection = MagicMock()
         mock_collection.insert_many.return_value = MagicMock(inserted_ids=['id1'])
+        mock_fs = MagicMock()
+        mock_fs.find.return_value = []
 
         with (
             patch(
                 'plugins.analysis.external_llm_analyze.code.external_llm_analyze.get_primary_collection',
                 return_value=mock_collection,
+            ),
+            patch(
+                'plugins.analysis.external_llm_analyze.code.external_llm_analyze.get_gridfs_bucket',
+                return_value=mock_fs,
             ),
         ):
             tmp_file = io.BytesIO(b'\x7fELF')
@@ -52,11 +62,17 @@ class TestExternalLlmAnalyze:
 
         mock_collection = MagicMock()
         mock_collection.insert_many.return_value = MagicMock(inserted_ids=['id1'])
+        mock_fs = MagicMock()
+        mock_fs.find.return_value = []
 
         with (
             patch(
                 'plugins.analysis.external_llm_analyze.code.external_llm_analyze.get_primary_collection',
                 return_value=mock_collection,
+            ),
+            patch(
+                'plugins.analysis.external_llm_analyze.code.external_llm_analyze.get_gridfs_bucket',
+                return_value=mock_fs,
             ),
         ):
             tmp_file = io.BytesIO(b'\x7fELF')
@@ -87,6 +103,90 @@ class TestExternalLlmAnalyze:
         assert result.records_count == 0
         assert 'mongo not available' in result.error_message
 
+    # ------------------------------------------------------------------
+    # analyze() – binary storage
+    # ------------------------------------------------------------------
+
+    def test_analyze_stores_binary(self, analysis_plugin: AnalysisPlugin):
+        """analyze() stores the binary bytes via GridFS and reports binary_stored=True."""
+        mock_collection = MagicMock()
+        mock_collection.insert_many.return_value = MagicMock(inserted_ids=['id1'])
+        mock_fs = MagicMock()
+        mock_fs.find.return_value = []
+
+        with (
+            patch(
+                'plugins.analysis.external_llm_analyze.code.external_llm_analyze.get_primary_collection',
+                return_value=mock_collection,
+            ),
+            patch(
+                'plugins.analysis.external_llm_analyze.code.external_llm_analyze.get_gridfs_bucket',
+                return_value=mock_fs,
+            ),
+        ):
+            content = b'\x7fELF\x00\x01\x02\x03'
+            tmp_file = io.BytesIO(content)
+            tmp_file.name = '/storage/ab/abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678_4'
+            result = analysis_plugin.analyze(tmp_file, {}, {})
+
+        assert result.binary_stored is True
+        assert result.binary_size == len(content)
+        mock_fs.put.assert_called_once()
+        call_kwargs = mock_fs.put.call_args
+        assert call_kwargs[1]['filename'] == 'abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678_4'
+        assert call_kwargs[0][0] == content
+
+    def test_analyze_binary_failure_does_not_abort(self, analysis_plugin: AnalysisPlugin):
+        """If GridFS storage fails the function records are still reported as stored."""
+        mock_collection = MagicMock()
+        mock_collection.insert_many.return_value = MagicMock(inserted_ids=['id1'])
+        mock_fs = MagicMock()
+        mock_fs.find.return_value = []
+        mock_fs.put.side_effect = OSError('disk full')
+
+        with (
+            patch(
+                'plugins.analysis.external_llm_analyze.code.external_llm_analyze.get_primary_collection',
+                return_value=mock_collection,
+            ),
+            patch(
+                'plugins.analysis.external_llm_analyze.code.external_llm_analyze.get_gridfs_bucket',
+                return_value=mock_fs,
+            ),
+        ):
+            tmp_file = io.BytesIO(b'\x7fELF')
+            tmp_file.name = '/storage/ab/abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678_4'
+            result = analysis_plugin.analyze(tmp_file, {}, {})
+
+        # Function records were stored successfully.
+        assert result.stored is True
+        assert result.records_count == 1
+        # Binary storage failed gracefully.
+        assert result.binary_stored is False
+        assert result.binary_size == 0
+
+    def test_store_binary_replaces_existing(self, analysis_plugin: AnalysisPlugin):
+        """_store_binary deletes old GridFS entries before inserting the new one."""
+        old_entry = MagicMock()
+        old_entry._id = 'old_id'  # noqa: SLF001
+
+        mock_fs = MagicMock()
+        mock_fs.find.return_value = [old_entry]
+
+        with patch(
+            'plugins.analysis.external_llm_analyze.code.external_llm_analyze.get_gridfs_bucket',
+            return_value=mock_fs,
+        ):
+            data = b'\x7fELF'
+            AnalysisPlugin._store_binary('some_uid', io.BytesIO(data))
+
+        mock_fs.delete.assert_called_once_with('old_id')
+        mock_fs.put.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # summarize()
+    # ------------------------------------------------------------------
+
     def test_summarize_stored(self, analysis_plugin: AnalysisPlugin):
         result = AnalysisPlugin.Schema(mongo_collection='col', records_count=3, stored=True)
         assert analysis_plugin.summarize(result) == ['stored']
@@ -96,6 +196,10 @@ class TestExternalLlmAnalyze:
             mongo_collection='col', records_count=0, stored=False, error_message='err'
         )
         assert analysis_plugin.summarize(result) == ['storage_failed']
+
+    # ------------------------------------------------------------------
+    # _build_records()
+    # ------------------------------------------------------------------
 
     def test_build_records_empty_ghidra(self, analysis_plugin: AnalysisPlugin):
         ghidra = MagicMock()
@@ -109,3 +213,4 @@ class TestExternalLlmAnalyze:
         records = AnalysisPlugin._build_records({})
         assert len(records) == 1
         assert records[0]['function_name'] == ''
+
